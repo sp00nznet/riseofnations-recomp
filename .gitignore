@@ -1,0 +1,55 @@
+# Build output
+build/
+out/
+cmake-build-*/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# IDE
+.vs/
+.vscode/
+*.user
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# --- Retail game files: NOT redistributed (REPO_RULES section 3) ---
+# Rise of Nations (c) Microsoft / Big Huge Games. In copyright.
+# Bring your own copy; Setup.cmd copies only riseofnations.exe into work/.
+game/
+original/
+*.exe
+*.EXE
+*.dll
+*.DLL
+*.dat
+*.big
+*.vp6
+*.SkuDef
+*.iso
+*.zip
+
+# Generated from the binary, never committed: the lifted C, the catalog,
+# RTTI/vtable dumps and every other analysis of riseofnations.exe.
+src/recomp/gen/
+work/
+analysis/
+
+# Recordings and logs of runs
+*.mp4
+*.log
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Made by Setup.cmd
+Rise of Nations (recomp).cmd
+game.path
+setup.log
+build-farm*/

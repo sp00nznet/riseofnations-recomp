@@ -1,0 +1,18 @@
+{
+  "title": "Rise of Nations: Extended Edition",
+  "repo": "sp00nznet/ron",
+  "accent": "#b8892f",
+  "note": {
+    "windows": "The first build takes one to two hours and about 8 GB. Python, pefile and capstone, CMake and Ninja are installed if they are missing; Visual Studio 2022 with 'Desktop development with C++' (the free Build Tools will do) must already be installed. The game stays in your Steam folder."
+  },
+  "game": {
+    "name": "Rise of Nations: Extended Edition",
+    "files": ["riseofnations.exe"],
+    "steam": "Rise of Nations"
+  },
+  "sources": [{ "repo": "sp00nznet/pcrecomp", "ref": "main", "dir": "pcrecomp" }],
+  "setup": {
+    "windows": ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/setup.ps1", "-Yes", "-Game", "{game}"]
+  },
+  "play": "* (recomp).*"
+}
