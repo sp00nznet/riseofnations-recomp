@@ -40,9 +40,11 @@ target_include_directories(ron PRIVATE
 # 0xDEAD0000 into a size argument (forcecommander).
 target_compile_definitions(ron PRIVATE RECOMP_RETADDR=0u _CRT_SECURE_NO_WARNINGS
                                     RECOMP_FLAT_MEMORY RECOMP_LOCAL_REGS)
-# Linked high and not relocatable, so the guest's 0x00400000..0x00FB3000 is
+# Linked at 0x20000000, not high: 390 MB of host from 0x60000000 runs into
+# WOW64's 32-bit system DLLs near 0x77000000 and Windows will not start it
+# ("the subsystem needed ... is not present"). The guest's 0x00400000..0x00FB3000 is
 # free (the host owns that range; the guest is mapped at its preferred base).
-target_link_options(ron PRIVATE /BASE:0x60000000 /FIXED:NO /DYNAMICBASE:NO
+target_link_options(ron PRIVATE /BASE:0x20000000 /FIXED:NO /DYNAMICBASE:NO
                                /NXCOMPAT /LARGEADDRESSAWARE /STACK:0x1000000
                                /MANIFESTUAC:NO)
 set(GEN_OPT "/O2" CACHE STRING "optimisation for the generated C")

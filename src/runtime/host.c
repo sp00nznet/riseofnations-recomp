@@ -6,7 +6,7 @@
  * here is only what is specific to this game: where the image goes, the
  * guest's identity and command line, and the fault report. docs/bringup.md has the reasoning.
  *
- * Linked at /BASE:0x60000000 (CMakeLists.txt) so 0x00400000..0x013E1000 is
+ * Linked at /BASE:0x20000000 (CMakeLists.txt) so 0x00400000..0x00FB3000 is
  * free when main() maps the image. riseofnations.exe imports little of Win32
  * directly and finds the rest with GetProcAddress, so that is shimmed too:
  * a name in the shim table answers with the shim.
@@ -66,8 +66,7 @@ static void shim_CreateWindowExA(void) {
                              (int)ARG(7), parent, (HMENU)(uintptr_t)ARG(9),
                              (HINSTANCE)(uintptr_t)ARG(10), (LPVOID)(uintptr_t)ARG(11));
     if (h && !parent) SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
-    fprintf(stderr, "[headless] CreateWindowExA(%s) style 0x%08X -> %p
-", gstr(ARG(2)), style, (void*)h);
+    fprintf(stderr, "[headless] CreateWindowExA(%s) style 0x%08X -> %p\n", gstr(ARG(2)), style, (void*)h);
     g_eax = (uint32_t)(uintptr_t)h;
     g_esp += 4 + 12 * 4;
 }
@@ -314,7 +313,7 @@ static void NTAPI exit_report(PVOID h, DWORD reason, PVOID r) {
     WriteFile(GetStdHandle(STD_ERROR_HANDLE), g_crash_buf, (DWORD)g_crash_len, &w, NULL);
 }
 #pragma comment(linker, "/INCLUDE:__tls_used")
-#pragma comment(linker, "/INCLUDE:_tw_exit_report")
+#pragma comment(linker, "/INCLUDE:_ron_exit_report")
 #pragma const_seg(".CRT$XLB")
 const PIMAGE_TLS_CALLBACK ron_exit_report = exit_report;
 #pragma const_seg()
