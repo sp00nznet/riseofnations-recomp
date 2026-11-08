@@ -49,7 +49,10 @@ STATS = os.path.join(_HERE, 'work', 'lift_stats.json')
 # Entries the catalog does not find, so a clean checkout lifts them too
 # (docs/bringup.md): this-adjustor thunks and other code reached only through
 # a pointer in data. An unresolved ICALL answers eax = 0 and carries on.
-RUN_SEEDS = []
+RUN_SEEDS = [
+    0x004048A0,  # static initializer in the _initterm table (0x00AC57C8..0x00AC6934),
+                 # reached only through that table: the first boot wall.
+]
 
 # Functions whose body is the host's instead of the lift: the host defines
 # ron_hook_XXXXXXXX(void) and it runs like an import shim. src/runtime/host.c.
