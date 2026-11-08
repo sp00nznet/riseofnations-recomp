@@ -44,3 +44,27 @@ then testbox (VM 103 on dpiprox2) stopped answering on 10.77.0.2: the VM
 runs and its desktop draws (another job's Strike Force window up front, from
 `qm monitor screendump`), but ping and ssh from the NAT bridge time out.
 Ops needs to look at it; the next run goes back to testbox.
+
+## 2. Next wall: a null read in sub_00A2B530 (run 2, 2026-11-08)
+
+With the seed in (73,896 lifted, farm build copied off builder-clangcl-140),
+`_initterm` finishes and the game gets further into startup:
+
+```
+ron.exe --run --headless --watchdog 60 --game "E:\SteamLibrary\steamapps\common\Rise of Nations"
+  lifted functions in dispatch: 73896
+  entering 0x0055D699
+=== fault 0xC0000005 at 0x321A81AC, thread 13300 ===
+  read of 0x00000000 (null/low)
+  in lifted sub_00A2B530, last native call (none)
+  eax=00000001 ecx=692FC0AC edx=00000000 ebx=0182D440 esp=0746F2E8 ebp=0746F560 esi=00000000 edi=00000000
+```
+
+`sub_00A2B530` is a /GS + SEH function with a 0x25C-byte frame. Return
+addresses on the guest stack point at its callers in `0x00B193D4` and
+`0x00B19586` (the code around 0x00B19xxx, with 0x00EDEB78 as an argument).
+The indirect-call ring is empty, so no import was involved. Not looked
+into yet: the next run should use `--calltrace` and `--watch 0x00A2B530`
+to find which pointer is null (most likely a global a missed initializer
+or an import shim should have filled), and run on testbox again once it's
+reachable. No window yet, so no screenshot.
