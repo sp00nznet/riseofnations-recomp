@@ -36,6 +36,8 @@ from capstone import Cs, CS_ARCH_X86, CS_MODE_32          # noqa: E402
 from generate import (EXTENT_REACH, closure, find_splits, true_extent,  # noqa: E402
                       linear_disassemble_function, lift_function_linear, write_chunk)
 from lift32 import Lifter                                  # noqa: E402
+from eh32 import resume_points                             # noqa: E402
+import pefile                                              # noqa: E402
 from pe_analyze import analyze_pe, build_iat_map           # noqa: E402
 
 # Setup.cmd copies the install's riseofnations.exe here (docs/RECON.md).
@@ -154,6 +156,11 @@ def main():
     md.detail = True
     text = [s for s in info.sections if s.name == '.text'][0]
     code = open(args.exe, 'rb').read()[text.raw_offset:text.raw_offset + text.raw_size]
+    # The image as mapped, for the EH tables in .rdata: a catch has to resume
+    # inside the lifted body that owns it (pcrecomp eh32, simcity4's run_lift.py).
+    mapped = pefile.PE(args.exe).get_memory_mapped_image()
+    base = info.image_base
+    read = lambda va, n: mapped[va - base:va - base + n] if 0 <= va - base < len(mapped) else None  # noqa: E731
 
     # Known targets become RECOMP_CALL; anything else a decoded `call` names
     # becomes RECOMP_ICALL, which reports at run time instead of failing the build.
@@ -175,6 +182,16 @@ def main():
     t_split = time.time()
     splits = find_splits(md, code, cs, ce, starts)
     starts -= splits          # still dispatchable; just not a wall inside its parent
+    # Where a function resumes after its own catch blocks: not a wall, walked
+    # as part of its parent.
+    eh_at = {}
+    for a in byaddr:
+        r = resume_points(md, read, list(md.disasm(read(a, 64) or b'', a))[:12])
+        if r:
+            eh_at[a] = r
+    starts -= set().union(*eh_at.values()) if eh_at else set()
+    print('[*] functions with C++ catch blocks: %d (%d resume points)'
+          % (len(eh_at), sum(len(v) for v in eh_at.values())))
     print('[*] split entries (the middle of the function before them): %d, %.0fs'
           % (len(splits), time.time() - t_split))
     t0 = time.time()
@@ -200,7 +217,7 @@ def main():
                               if end > addr else ([], None))
             if leaders is not None:
                 leaders.add(addr)
-            body = (lift_function_linear(lifter, name, insns, leaders, addr) if insns
+            body = (lift_function_linear(lifter, name, insns, leaders, addr, eh_resume=eh_at.get(addr)) if insns
                     else 'void %s(void) { }\n' % name)
             body = apply_patches(body, {va: c for va, c in patches.items() if reached and va in reached})
         except Exception as e:                      # noqa: BLE001 -- counted, not hidden
@@ -228,6 +245,11 @@ def main():
             reached, behind, called = set(), set(), set()
             end, clean = true_extent(md, code, cs, addr, min(addr + EXTENT_REACH, ce), starts,
                                      reached=reached, behind=behind, called=called)
+            for r in eh_at.get(addr, ()):
+                if cs <= r < ce:
+                    e2, _ = true_extent(md, code, cs, r, min(r + EXTENT_REACH, ce), starts,
+                                        reached=reached, behind=behind, called=called)
+                    end = max(end, e2)
             outside |= {t for t in behind if t not in reached} | called
             dirty += not clean
             lift_one(addr, name, end, reached)
