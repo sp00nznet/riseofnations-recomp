@@ -68,3 +68,26 @@ into yet: the next run should use `--calltrace` and `--watch 0x00A2B530`
 to find which pointer is null (most likely a global a missed initializer
 or an import shim should have filled), and run on testbox again once it's
 reachable. No window yet, so no screenshot.
+
+## 3. To the main menu and a battle (runs 3 to 79, 2026-11-11 to 11-18)
+
+- **Guest TLS.** The null read in `sub_00A2B530` was `__declspec(thread)`
+  data: native32's guest TIB had no TLS array (`[0x2C]` = 0). The toolkit now
+  gives guest threads the exe's implicit TLS (pcrecomp#190); the exe reads TLS
+  127 times.
+- **C++ exceptions.** `_CxxThrowException` and the rethrow path are shimmed
+  in the host, with the lifter's EH setup (pcrecomp `ron-build`, #193).
+- **String-table popups.** The loader's main-module name is now the install's
+  `riseofnations.exe`, so native DLLs resolve their files there and msxml
+  finds `translated_string.xml`.
+- **Remote Desktop.** `GetSystemMetrics(SM_REMOTESESSION)` answers 0; the
+  renderer otherwise refuses to start over RDP.
+- **The black world.** Menus drew, battles ran, the 3D world was black. The
+  shaders compiled and the lifted SSE and x87 looked right; the cause was the
+  CRT's `_libm_sse2_{sin,cos,tan,sqrt}_precise`, which pass their argument and
+  result in `xmm0` and which the native bridge mangled, so the camera's
+  matrices came out garbage. They are shimmed in `host.c`, and battles render.
+
+Test runs from here on use `tools/hidden_run.py`: a private, never-shown
+desktop, `--mute`, scripted clicks (`RON_CLICKS`) and back-buffer dumps
+(`RON_SNAP`). The README's hero gif is one of those runs (run 79).

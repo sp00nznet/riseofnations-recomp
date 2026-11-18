@@ -55,7 +55,7 @@ if(MSVC_VERSION GREATER_EQUAL 1950)
 endif()
 set_source_files_properties(${GEN_SOURCES} PROPERTIES COMPILE_OPTIONS "/w;${GEN_OPT}")
 set_source_files_properties(src/runtime/host.c PROPERTIES COMPILE_OPTIONS "/W3")
-target_link_libraries(ron PRIVATE user32 gdi32 kernel32 winmm)
+target_link_libraries(ron PRIVATE user32 gdi32 kernel32 winmm ole32 d3d11 dxguid)
 
 option(RON_TRACE "record a ring buffer of lifted function entries" OFF)
 if(RON_TRACE)

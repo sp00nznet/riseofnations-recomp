@@ -18,7 +18,14 @@ $Toolkit = if ($env:PCRECOMP) { (Resolve-Path $env:PCRECOMP).Path } elseif (Test
 $T = Join-Path $Toolkit 'tools'
 $Log = Join-Path $Root 'setup.log'
 $Exe = 'work\riseofnations.exe'
+$Branch = 'ron-build'
 Set-Location $Root
+# cmd.exe, which the build runs commands through, splits a path at '&'.
+if ($Root -match '&') {
+  Write-Host "This folder's path has an '&' in it, which the build cannot handle:`n  $Root" -ForegroundColor Red
+  Write-Host "Move the folder somewhere else (for example C:\riseofnations-recomp) and run Setup.cmd from there." -ForegroundColor Yellow
+  if (-not $env:RECOMP_LAUNCHER) { Read-Host "Press Enter to close" | Out-Null }; exit 1
+}
 # A log line that cannot be written (the log open in another program) is
 # not a reason to stop the setup.
 function Log($t) { try { Add-Content -Path $Log -Value $t -Encoding UTF8 -ErrorAction Stop } catch {} }
@@ -96,11 +103,19 @@ if (-not (Test-Path (Join-Path $T 'lift\lift32.py'))) {
   Say "  The pcrecomp toolkit is not beside this folder ($Toolkit)."
   if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Fail "git is needed to fetch pcrecomp. Install Git for Windows, then run Setup.cmd again." }
   if (-not (Ask "  Download it now (git, about 20 MB)?")) { Fail "pcrecomp is required at $Toolkit." }
-  Run "Cloning pcrecomp" @('git', 'clone', '--depth', '1', 'https://github.com/sp00nznet/pcrecomp', $Toolkit)
+  Run "Cloning pcrecomp" @('git', 'clone', '--depth', '1', '--branch', $Branch, 'https://github.com/sp00nznet/pcrecomp', $Toolkit)
 }
-if (-not (Test-Path (Join-Path $Toolkit 'runtime\native32\native32.c'))) {
-  Fail "your pcrecomp at $Toolkit predates runtime\native32. Update it: git -C `"$Toolkit`" pull"
+# ponytail: pinned to pcrecomp's ron-build branch (guest TLS, EH and bridge
+# fixes) until pcrecomp#190 and #193 are on main; then drop $Branch.
+$fresh = { Select-String -Quiet -SimpleMatch 'IN_PLACE_ROOM' (Join-Path $Toolkit 'runtime\native32\native32.c') -ErrorAction SilentlyContinue }
+if (-not (& $fresh) -and (Test-Path (Join-Path $Toolkit '.git'))) {
+  Say "  Your pcrecomp lacks the fixes this game needs (its $Branch branch)."
+  if (Ask "  Switch it to $Branch now (git)?") {
+    Run "Fetching pcrecomp $Branch" @('git', '-C', $Toolkit, 'fetch', '--depth', '1', 'origin', $Branch)
+    Run "Switching pcrecomp to $Branch" @('git', '-C', $Toolkit, 'checkout', '-B', $Branch, 'FETCH_HEAD')
+  }
 }
+if (-not (& $fresh)) { Fail "your pcrecomp at $Toolkit lacks this game's fixes. Check out its $Branch branch: git -C `"$Toolkit`" fetch origin $Branch, then git -C `"$Toolkit`" checkout FETCH_HEAD" }
 Say "  pcrecomp: $Toolkit"
 
 # The compiler. build.cmd finds Visual Studio itself; this only checks that it
@@ -108,7 +123,16 @@ Say "  pcrecomp: $Toolkit"
 # of its own, so this says what to install rather than installing it.
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 $vs = if (Test-Path $vswhere) { (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath) } else { $null }
-if (-not $vs) { Fail "Visual Studio 2022 (or its Build Tools) with 'Desktop development with C++' is needed. Install it, then run Setup.cmd again." }
+if (-not $vs) {
+  Say "  Visual Studio 2022 with the C++ tools is not installed."
+  if (-not (Ask "  Install the Visual Studio 2022 Build Tools with the C++ workload now (winget, about 3 GB, asks for admin)?")) {
+    Fail "Visual Studio 2022 (or its Build Tools) with 'Desktop development with C++' is needed. Install it, then run Setup.cmd again."
+  }
+  Exec @('winget', 'install', '-e', '--id', 'Microsoft.VisualStudio.2022.BuildTools', '--accept-package-agreements', '--accept-source-agreements',
+         '--override', '--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended') | Out-Null
+  $vs = if (Test-Path $vswhere) { (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath) } else { $null }
+  if (-not $vs) { Fail "the Visual Studio Build Tools did not install. Install them with 'Desktop development with C++', then run Setup.cmd again." }
+}
 Say "  Visual Studio: $vs"
 # $tool, not $t: PowerShell names are case-insensitive, and $T is the toolkit path.
 foreach ($tool in @(@('cmake', 'Kitware.CMake', '30 MB'), @('ninja', 'Ninja-build.Ninja', '1 MB'))) {
@@ -188,6 +212,7 @@ else {
 Step 6 "Building build\ron.exe (30 to 60 minutes)"
 if ((Test-Path 'build\ron.exe') -and -not $Force) { Say "  Already done (skipping)." }
 else {
+  $env:CMAKE_ARGS = "-DPCRECOMP=`"$Toolkit`""   # build.cmd hands it to CMake, which defaults to ..\tools
   Run "Compiling" @('cmd', '/c', (Join-Path $Root 'build.cmd'))
 }
 
@@ -196,12 +221,12 @@ Step 7 "Making the shortcut"
 $lnk = Join-Path $Root 'Rise of Nations (recomp).cmd'
 Set-Content -Path $lnk -Encoding ASCII -Value @(
   '@echo off',
-  'rem Runs the recompiled game (bring-up: docs/bringup.md says how far it gets).',
+  'rem Runs the recompiled game. Set the in-game resolution to your desktop''s.',
   'cd /d "%~dp0"',
   "build\ron.exe --run --game `"$Game`"")
 Say "  $lnk"
 
 Write-Host ""
 Say "Done. Double-click 'Rise of Nations (recomp).cmd' to run it." 'Green'
-Say "This is a bring-up build: it boots to the main menu (README, Status)."
+Say "Set the in-game resolution to your desktop's, or every screen switches modes (README, Known issues)."
 Pause-End

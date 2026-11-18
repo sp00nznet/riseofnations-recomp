@@ -14,6 +14,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winternl.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +31,7 @@ extern const uint32_t ron_entry_va;    /* recomp_dispatch.c */
 
 static DWORD g_watchdog_s;
 static int   g_headless;
+static volatile long g_nmaps, g_nupds, g_ndraws, g_nupd1;   /* D3D11 calls seen (RON_LOG_CBUF) */
 
 #define ARG(n) MEM32(g_esp + 4 + 4 * (n))
 static const char* gstr(uint32_t va) { return va ? (const char*)(uintptr_t)va : "(null)"; }
@@ -137,6 +139,7 @@ static void shim_FreeLibrary(void) {
  * say so, and flush --calltrace, whose newest entries are the ones that matter. */
 static void shim_TerminateProcess(void) {
     fprintf(stderr, "\n[exit] TerminateProcess(0x%X) from sub_%08X\n", ARG(1), g_cur_func);
+    fprintf(stderr, "[d3d11] Map %ld UpdateSubresource %ld UpdateSubresource1 %ld draws %ld\n", g_nmaps, g_nupds, g_nupd1, g_ndraws);
     native32_dump_icalls(8);
     recomp_trace_flush();
     TerminateProcess((HANDLE)(uintptr_t)ARG(0), ARG(1));
@@ -248,9 +251,12 @@ static int WINAPI hook_GetSystemMetrics(int i) {
 }
 
 /* Jump from dll!name to `to`; returns a trampoline that calls the original. */
+static void* hook_code(uint8_t* f, const char* name, void* to);
 static void* hook_export(const char* dll, const char* name, void* to) {
+    return hook_code((uint8_t*)GetProcAddress(LoadLibraryA(dll), name), name, to);
+}
+static void* hook_code(uint8_t* f, const char* name, void* to) {
     static const uint8_t hotpatch[5] = { 0x8B, 0xFF, 0x55, 0x8B, 0xEC };
-    uint8_t* f = (uint8_t*)GetProcAddress(LoadLibraryA(dll), name);
     DWORD was;
     /* Whole instructions to move, none relative to where they sit: the
      * hot-patch prologue, or the SEH one (push imm8; push imm32) that Windows
@@ -302,13 +308,42 @@ static long WINAPI log_D3DCompile(const void* src, size_t len, const char* name,
     log_compile(hr, name ? name : "(memory)", entry, target, err);
     return hr;
 }
+static const char* where_is(uint32_t a);
 /* RON_LOG_CBUF: dump the constant buffers d3dgl fills (camera, lights,
  * tone mapping), a sample per buffer size, to check what the game computes. */
 static void* g_map_ptr[64]; static void* g_map_res[64]; static int g_nmap;
 static unsigned g_cb_seen[8192];
-static long (WINAPI* real_Map)(void*, void*, unsigned, int, unsigned, void*);
-static void (WINAPI* real_Unmap)(void*, void*, unsigned);
-static void (WINAPI* real_UpdateSubresource)(void*, void*, unsigned, const void*, const void*, unsigned, unsigned);
+/* Each context interface has its own method table; keep each one's originals. */
+typedef long (WINAPI* map_fn)(void*, void*, unsigned, int, unsigned, void*);
+typedef void (WINAPI* unmap_fn)(void*, void*, unsigned);
+typedef void (WINAPI* upd_fn)(void*, void*, unsigned, const void*, const void*, unsigned, unsigned);
+static struct { void** vt; map_fn map; unmap_fn unmap; upd_fn upd; } g_ctx_vt[32]; static int g_nctx_vt;
+static int ctx_vt(void* c) {
+    for (int i = g_nctx_vt - 1; i >= 0; i--) if (g_ctx_vt[i].vt == *(void***)c) return i;
+    return g_nctx_vt - 1;   /* swapped since: any table's originals are the same code family */
+}
+static long WINAPI log_Map(void*, void*, unsigned, int, unsigned, void*);
+static void WINAPI log_Unmap(void*, void*, unsigned);
+static void WINAPI log_UpdateSubresource(void*, void*, unsigned, const void*, const void*, unsigned, unsigned);
+static void* g_ctx;
+/* d3d11 swaps the immediate context's method table after creation; patch
+ * whichever one is current, as often as it changes. */
+static DWORD WINAPI ctx_patch_loop(void* unused) {
+    (void)unused;
+    for (;; Sleep(50)) {
+        void** vt = *(void***)g_ctx; DWORD was;
+        if (vt[14] == (void*)log_Map || g_nctx_vt == 32) continue;
+        g_ctx_vt[g_nctx_vt].vt = vt;
+        g_ctx_vt[g_nctx_vt].map = (map_fn)vt[14];
+        g_ctx_vt[g_nctx_vt].unmap = (unmap_fn)vt[15];
+        g_ctx_vt[g_nctx_vt].upd = (upd_fn)vt[48];
+        g_nctx_vt++;
+        VirtualProtect(vt, 64 * 4, PAGE_READWRITE, &was);
+        vt[14] = log_Map; vt[15] = log_Unmap; vt[48] = log_UpdateSubresource;
+        VirtualProtect(vt, 64 * 4, was, &was);
+        fprintf(stderr, "[d3d11] context table %p patched (#%d)\n", (void*)vt, g_nctx_vt);
+    }
+}
 static void dump_cb(void* res, const float* p, const char* how) {
     struct { unsigned w, usage, bind, cpu, misc, stride; } d;
     int type; ((void (WINAPI*)(void*, int*))(*(void***)res)[7])(res, &type);
@@ -320,8 +355,8 @@ static void dump_cb(void* res, const float* p, const char* how) {
     fprintf(stderr, "\n"); fflush(stderr);
 }
 static long WINAPI log_Map(void* c, void* res, unsigned sub, int type, unsigned fl, void* out) {
-    long hr = real_Map(c, res, sub, type, fl, out);
-    static int calls; if (calls++ < 3) fprintf(stderr, "[d3d11] Map type=%d hr=%08lX\n", type, hr);
+    long hr = g_ctx_vt[ctx_vt(c)].map(c, res, sub, type, fl, out);
+    InterlockedIncrement(&g_nmaps);
     if (hr >= 0 && g_nmap < 64) { g_map_res[g_nmap] = res; g_map_ptr[g_nmap++] = *(void**)out; }
     return hr;
 }
@@ -330,12 +365,26 @@ static void WINAPI log_Unmap(void* c, void* res, unsigned sub) {
         dump_cb(res, (const float*)g_map_ptr[i], "map");
         g_map_res[i] = g_map_res[--g_nmap]; g_map_ptr[i] = g_map_ptr[g_nmap]; break;
     }
-    real_Unmap(c, res, sub);
+    g_ctx_vt[ctx_vt(c)].unmap(c, res, sub);
 }
 static void WINAPI log_UpdateSubresource(void* c, void* res, unsigned sub, const void* box, const void* src,
                                          unsigned rp, unsigned dp) {
+    InterlockedIncrement(&g_nupds);
     if (src) dump_cb(res, (const float*)src, "upd");
-    real_UpdateSubresource(c, res, sub, box, src, rp, dp);
+    g_ctx_vt[ctx_vt(c)].upd(c, res, sub, box, src, rp, dp);
+}
+typedef void (WINAPI* draw_fn)(void*, unsigned, unsigned, int, unsigned, unsigned);
+static draw_fn real_draw[4];
+#define DRAW_HOOK(i) static void WINAPI log_draw##i(void* c, unsigned a, unsigned b, int d, unsigned e, unsigned f) \
+    { InterlockedIncrement(&g_ndraws); real_draw[i](c, a, b, d, e, f); }
+DRAW_HOOK(0) DRAW_HOOK(1) DRAW_HOOK(2) DRAW_HOOK(3)
+typedef void (WINAPI* upd1_fn)(void*, void*, unsigned, const void*, const void*, unsigned, unsigned, unsigned);
+static upd1_fn real_upd1;
+static void WINAPI log_upd1(void* c, void* res, unsigned sub, const void* box, const void* src, unsigned rp,
+                            unsigned dp, unsigned fl) {
+    InterlockedIncrement(&g_nupd1);
+    if (src) dump_cb(res, (const float*)src, "upd1");
+    real_upd1(c, res, sub, box, src, rp, dp, fl);
 }
 static long (WINAPI* real_D3D11CreateDevice)(void*, int, void*, unsigned, const void*, unsigned, unsigned,
                                              void**, void*, void**);
@@ -354,22 +403,12 @@ static long WINAPI log_D3D11CreateDevice(void* a, int t, void* sw, unsigned fl, 
         {0x420d5b32,0xb90c,0x4da4,{0xbe,0xf0,0x35,0x9f,0x6a,0x24,0xa8,0x3a}},
         {0xb4e3c01d,0xe79e,0x4637,{0x91,0xb2,0x51,0x0e,0x9f,0x4c,0x9b,0x8f}},
         {0x917600da,0xf58c,0x4c33,{0x98,0xd8,0x3e,0x15,0xb3,0x90,0xfa,0x24}} };
-    for (int q = 0; hr >= 0 && c && q < 5; q++) {
-        void* ci = NULL;
-        ((long (WINAPI*)(void*, const GUID*, void**))(*(void***)c)[0])(c, &ctx_iids[q], &ci);
-        if (!ci) continue;
-        ((unsigned long (WINAPI*)(void*))(*(void***)ci)[2])(ci);
-        if ((*(void***)ci)[14] == (void*)log_Map) continue;
-        void** vt = *(void***)ci; DWORD was;
-        if (real_Map && (vt[14] != (void*)real_Map || vt[15] != (void*)real_Unmap)) {
-            fprintf(stderr, "[d3d11] iface %d has other Map %p: skipped\n", q, vt[14]); continue;
-        }
-        VirtualProtect(vt, 64 * 4, PAGE_READWRITE, &was);
-        *(void**)&real_Map = vt[14]; vt[14] = log_Map;
-        *(void**)&real_Unmap = vt[15]; vt[15] = log_Unmap;
-        *(void**)&real_UpdateSubresource = vt[48]; vt[48] = log_UpdateSubresource;
-        VirtualProtect(vt, 64 * 4, was, &was);
-        fprintf(stderr, "[d3d11] patched vt=%p map now %p (log %p)\n", (void*)vt, vt[14], (void*)log_Map);
+    /* The context's method table is a per-object copy d3d11 may swap, so the
+     * code itself is hooked: the second device's (the first is d3dgl's probe). */
+    static int ndev;
+    if (hr >= 0 && c && ++ndev == 2) {     /* the first device is d3dgl's probe */
+        g_ctx = c;
+        CloseHandle(CreateThread(NULL, 0, ctx_patch_loop, NULL, 0, NULL));
     }
     return hr;
 }
@@ -381,7 +420,23 @@ static void hook_shader_compiler(void) {
     *(void**)&real_D3DCompile = hook_export("D3DCOMPILER_47.dll", "D3DCompile", log_D3DCompile);
 }
 
+/* The CRT's _libm_sse2_*_precise take and return a double in xmm0, not on
+ * the stack, so the native bridge (stack in, eax/st0 out) handed them junk
+ * and the game got junk back: the camera's rotation (cos/sin of its pitch)
+ * and the tone-mapping exposure came out garbage, and the world drew black.
+ * They run here on the guest's own xmm0. */
+#define LIBM_SHIM(name, fn) \
+    static void shim_##name(void) { g_xmm[0].f64[0] = fn(g_xmm[0].f64[0]); g_esp += 4; }
+LIBM_SHIM(libm_sin, sin)
+LIBM_SHIM(libm_cos, cos)
+LIBM_SHIM(libm_tan, tan)
+LIBM_SHIM(libm_sqrt, sqrt)
+
 #define GUEST_SHIMS \
+    { "_libm_sse2_sin_precise", shim_libm_sin }, \
+    { "_libm_sse2_cos_precise", shim_libm_cos }, \
+    { "_libm_sse2_tan_precise", shim_libm_tan }, \
+    { "_libm_sse2_sqrt_precise", shim_libm_sqrt }, \
     { "GetModuleHandleA", shim_GetModuleHandleA }, \
     { "GetModuleHandleExA", shim_GetModuleHandleExA }, \
     { "GetProcAddress", shim_GetProcAddress }, \
@@ -534,19 +589,188 @@ static void NTAPI exit_report(PVOID h, DWORD reason, PVOID r) {
 const PIMAGE_TLS_CALLBACK ron_exit_report = exit_report;
 #pragma const_seg()
 
+static HANDLE g_main_thread;
+/* "module+offset" for an address inside an executable section of a DLL, or "". */
+static const char* where_is(uint32_t a) {
+    static char out[MAX_PATH + 16]; char path[MAX_PATH]; HMODULE m; MEMORY_BASIC_INFORMATION mb;
+    if (!VirtualQuery((void*)(uintptr_t)a, &mb, sizeof mb) || !(mb.Protect & 0xF0)) return "";
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)(uintptr_t)a, &m) || !GetModuleFileNameA(m, path, sizeof path)) return "";
+    snprintf(out, sizeof out, "%s+%X", strrchr(path, 0x5C) + 1, a - (uint32_t)(uintptr_t)m);
+    return out;
+}
 static DWORD WINAPI watchdog(LPVOID unused) {
     (void)unused;
     Sleep(g_watchdog_s * 1000);
     fprintf(stderr, "\n[watchdog] %lu s: in sub_%08X, last native call %s, %u indirect calls\n",
             g_watchdog_s, g_cur_func, g_cur_import, g_icall_count);
+    fprintf(stderr, "[d3d11] Map %ld UpdateSubresource %ld UpdateSubresource1 %ld draws %ld\n", g_nmaps, g_nupds, g_nupd1, g_ndraws);
     native32_dump_icalls(8);
+    if (g_main_thread && SuspendThread(g_main_thread) != (DWORD)-1) {
+        CONTEXT cx = { .ContextFlags = CONTEXT_FULL };
+        GetThreadContext(g_main_thread, &cx);
+        fprintf(stderr, "main thread: eip %08lX %s, esp %08lX; code addresses on its stack:\n",
+                cx.Eip, where_is(cx.Eip), cx.Esp);
+        const uint32_t* sp = (const uint32_t*)(uintptr_t)cx.Esp;
+        for (int i = 0, shown = 0; i < 2048 && shown < 24 && !IsBadReadPtr(sp + i, 4); i++) {
+            const char* m = where_is(sp[i]);
+            if (*m) { fprintf(stderr, "  [esp+%04X] %08X %s\n", i * 4, sp[i], m); shown++; }
+        }
+    }
     recomp_trace_flush();
     fflush(stderr);
     TerminateProcess(GetCurrentProcess(), 4);
     return 0;
 }
 
+/* --mute (implied by --headless): mute this process's audio session on every
+ * output device, so test runs are silent. On its own MTA thread so the
+ * game's own CoInitialize on the main thread is untouched. */
+#define COBJMACROS
+#define CINTERFACE
+#include <mmdeviceapi.h>
+#include <audiopolicy.h>
+static const CLSID CLSID_MMDev = {0xBCDE0395,0xE52F,0x467C,{0x8E,0x3D,0xC4,0x57,0x92,0x91,0x69,0x2E}};
+static const IID IID_MMDevEnum = {0xA95664D2,0x9614,0x4F35,{0xA7,0x46,0xDE,0x8D,0xB6,0x36,0x17,0xE6}};
+static const IID IID_SessMgr = {0xBFA971F1,0x4D5E,0x40BB,{0x93,0x5E,0x96,0x70,0x39,0xBF,0xBE,0xE6}};
+static DWORD WINAPI mute_thread(void* quiet) {
+    IMMDeviceEnumerator* en = NULL; IMMDeviceCollection* all = NULL; UINT n = 0;
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(CoCreateInstance(&CLSID_MMDev, NULL, CLSCTX_ALL, &IID_MMDevEnum, (void**)&en)))
+        return 1;
+    IMMDeviceEnumerator_EnumAudioEndpoints(en, eRender, DEVICE_STATE_ACTIVE, &all);
+    if (all) IMMDeviceCollection_GetCount(all, &n);
+    for (UINT i = 0; i < n; i++) {
+        IMMDevice* d = NULL; IAudioSessionManager* m = NULL; ISimpleAudioVolume* v = NULL;
+        IMMDeviceCollection_Item(all, i, &d);
+        if (d && SUCCEEDED(IMMDevice_Activate(d, &IID_SessMgr, CLSCTX_ALL, NULL, (void**)&m))) {
+            if (SUCCEEDED(IAudioSessionManager_GetSimpleAudioVolume(m, NULL, FALSE, &v))) {
+                ISimpleAudioVolume_SetMute(v, TRUE, NULL);
+                ISimpleAudioVolume_Release(v);
+            }
+            IAudioSessionManager_Release(m);
+        }
+        if (d) IMMDevice_Release(d);
+    }
+    if (!quiet || !*(int*)quiet) fprintf(stderr, "[mute] muted on %u output device(s)\n", n);
+    IMMDeviceCollection_Release(all); IMMDeviceEnumerator_Release(en);
+    return 0;
+}
+/* Again every second: a device or session the game opens later is muted too. */
+static DWORD WINAPI mute_loop(void* unused) {
+    for (int quiet = 0;; quiet = 1) { mute_thread(&quiet); Sleep(1000); }
+}
+static void mute_audio(void) {
+    HANDLE t = CreateThread(NULL, 0, mute_thread, NULL, 0, NULL);
+    WaitForSingleObject(t, 5000); CloseHandle(t);
+    CloseHandle(CreateThread(NULL, 0, mute_loop, NULL, 0, NULL));
+}
+
+/* --headless runs on a hidden desktop (tools/hidden_run.py), where the game
+ * is never the foreground window and so stops rendering. Tell it it is. */
+static DWORD g_main_tid; static HWND g_game_wnd;
+static BOOL CALLBACK find_game_wnd(HWND h, LPARAM unused) {
+    RECT r; (void)unused;
+    if (GetWindow(h, GW_OWNER) || !GetWindowRect(h, &r) || r.right - r.left < 320) return TRUE;
+    g_game_wnd = h; return FALSE;
+}
+static HWND WINAPI fake_foreground(void) { return g_game_wnd; }
+/* RON_CLICKS="SECONDS:X,Y;SECONDS:X,Y...": left clicks at client X,Y, the
+ * cursor reported there too (GetCursorPos), to drive menus headlessly. */
+static POINT g_cursor;
+static BOOL WINAPI fake_GetCursorPos(POINT* p) { *p = g_cursor; ClientToScreen(g_game_wnd, p); return TRUE; }
+static void click_script(void) {
+    const char* p = getenv("RON_CLICKS");
+    DWORD t0 = GetTickCount();
+    while (p && *p) {
+        DWORD at = strtoul(p, (char**)&p, 0) * 1000; p += *p == ':';
+        int x = strtol(p, (char**)&p, 0); p += *p == ',';
+        int y = strtol(p, (char**)&p, 0); p += *p == ';';
+        DWORD now = GetTickCount() - t0;
+        if (at > now) Sleep(at - now);
+        g_cursor.x = x; g_cursor.y = y;
+        LPARAM l = MAKELPARAM(x, y);
+        PostMessageW(g_game_wnd, WM_MOUSEMOVE, 0, l); Sleep(150);
+        PostMessageW(g_game_wnd, WM_LBUTTONDOWN, MK_LBUTTON, l); Sleep(100);
+        PostMessageW(g_game_wnd, WM_LBUTTONUP, 0, l);
+        fprintf(stderr, "[headless] click %d,%d at %lus\n", x, y, at / 1000);
+    }
+}
+static DWORD WINAPI activate_loop(void* unused) {
+    (void)unused;
+    while (!g_game_wnd) { Sleep(200); EnumThreadWindows(g_main_tid, find_game_wnd, 0); }
+    fprintf(stderr, "[headless] game window %p: telling it it is active\n", (void*)g_game_wnd);
+    PostMessageW(g_game_wnd, WM_ACTIVATEAPP, TRUE, 0);
+    PostMessageW(g_game_wnd, WM_ACTIVATE, WA_ACTIVE, 0);
+    PostMessageW(g_game_wnd, WM_SETFOCUS, 0, 0);
+    click_script();
+    return 0;
+}
+/* RON_SNAP=SECONDS[,SECONDS...] (fractions ok, up to 160): at each time, the next presented frame goes
+ * to build-farm-style RON_SNAP_FILE (default snap.bmp; -N appended per shot).
+ * Present is hooked in dxgi's code, found from a throwaway swap chain. */
+#include <d3d11.h>
+static long (WINAPI* real_Present)(IDXGISwapChain*, UINT, UINT);
+static DWORD g_snap_at[160]; static int g_nsnap, g_snapped;
+static void snap_frame(IDXGISwapChain* sc) {
+    ID3D11Texture2D *bb = NULL, *st = NULL; ID3D11Device* dev = NULL; ID3D11DeviceContext* cx = NULL;
+    D3D11_TEXTURE2D_DESC d; D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(IDXGISwapChain_GetBuffer(sc, 0, &IID_ID3D11Texture2D, (void**)&bb))) return;
+    ID3D11Texture2D_GetDevice(bb, &dev); ID3D11Device_GetImmediateContext(dev, &cx);
+    ID3D11Texture2D_GetDesc(bb, &d);
+    d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+    d.SampleDesc.Count = 1; d.SampleDesc.Quality = 0;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &d, NULL, &st))) {
+        ID3D11DeviceContext_CopyResource(cx, (ID3D11Resource*)st, (ID3D11Resource*)bb);
+        if (SUCCEEDED(ID3D11DeviceContext_Map(cx, (ID3D11Resource*)st, 0, D3D11_MAP_READ, 0, &m))) {
+            char name[MAX_PATH]; const char* base = getenv("RON_SNAP_FILE");
+            snprintf(name, sizeof name, "%s-%d.bmp", base ? base : "snap", g_snapped);
+            BITMAPINFOHEADER bh = { sizeof bh, (LONG)d.Width, -(LONG)d.Height, 1, 32, BI_RGB };
+            BITMAPFILEHEADER fh = { 0x4D42, (DWORD)(sizeof fh + sizeof bh + d.Width * d.Height * 4), 0, 0, sizeof fh + sizeof bh };
+            FILE* f = fopen(name, "wb");
+            if (f) {
+                fwrite(&fh, sizeof fh, 1, f); fwrite(&bh, sizeof bh, 1, f);
+                for (UINT y = 0; y < d.Height; y++) fwrite((char*)m.pData + y * m.RowPitch, 4, d.Width, f);
+                fclose(f);
+            }
+            fprintf(stderr, "[snap] %s %ux%u format %u\n", name, d.Width, d.Height, d.Format);
+            ID3D11DeviceContext_Unmap(cx, (ID3D11Resource*)st, 0);
+        }
+        ID3D11Texture2D_Release(st);
+    }
+    ID3D11DeviceContext_Release(cx); ID3D11Device_Release(dev); ID3D11Texture2D_Release(bb);
+}
+static long WINAPI log_Present(IDXGISwapChain* sc, UINT sync, UINT fl) {
+    if (g_snapped < g_nsnap && GetTickCount() >= g_snap_at[g_snapped]) { snap_frame(sc); g_snapped++; }
+    return real_Present(sc, sync, fl);
+}
+static void hook_present(void) {
+    const char* p = getenv("RON_SNAP");
+    DWORD t0 = GetTickCount();
+    for (; p && *p && g_nsnap < 160; p += strspn(p, ", "))
+        g_snap_at[g_nsnap++] = t0 + (DWORD)(1000 * strtod(p, (char**)&p));
+    if (!g_nsnap) return;
+    HWND w = CreateWindowExA(0, "STATIC", "", WS_POPUP, 0, 0, 64, 64, NULL, NULL, NULL, NULL);
+    DXGI_SWAP_CHAIN_DESC sd = { { 64, 64, { 60, 1 }, DXGI_FORMAT_R8G8B8A8_UNORM }, { 1, 0 },
+                                DXGI_USAGE_RENDER_TARGET_OUTPUT, 2, w, TRUE, DXGI_SWAP_EFFECT_FLIP_DISCARD };
+    IDXGISwapChain* sc = NULL; ID3D11Device* dev = NULL; ID3D11DeviceContext* cx = NULL;
+    if (FAILED(D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION,
+                                             &sd, &sc, &dev, NULL, &cx))) { fprintf(stderr, "[snap] no swap chain\n"); return; }
+    *(void**)&real_Present = hook_code((uint8_t*)sc->lpVtbl->Present, "Present", log_Present);
+    IDXGISwapChain_Release(sc); ID3D11DeviceContext_Release(cx); ID3D11Device_Release(dev); DestroyWindow(w);
+}
+
+static void fake_active(void) {
+    hook_present();
+    g_main_tid = GetCurrentThreadId();
+    hook_export("user32.dll", "GetForegroundWindow", fake_foreground);
+    hook_export("user32.dll", "GetActiveWindow", fake_foreground);
+    if (getenv("RON_CLICKS")) hook_export("user32.dll", "GetCursorPos", fake_GetCursorPos);
+    CloseHandle(CreateThread(NULL, 0, activate_loop, NULL, 0, NULL));
+}
+
 int main(int argc, char** argv) {
+    int mute = 0;
     const char* game = "game";
     const char* extra = "";             /* --gameargs "...": appended to the guest's command line */
     char exe_full[MAX_PATH], game_full[MAX_PATH], exe_dir[MAX_PATH];
@@ -558,7 +782,8 @@ int main(int argc, char** argv) {
         int n = recomp_trace_arg(argc, argv, i);
         if (n) { i += n - 1; continue; }
         if (!strcmp(argv[i], "--run")) run = 1;
-        else if (!strcmp(argv[i], "--headless")) g_headless = 1;
+        else if (!strcmp(argv[i], "--headless")) g_headless = mute = 1;
+        else if (!strcmp(argv[i], "--mute")) mute = 1;
         else if (!strcmp(argv[i], "--game") && i + 1 < argc) game = argv[++i];
         else if (!strcmp(argv[i], "--gameargs") && i + 1 < argc) extra = argv[++i];
         else if (!strcmp(argv[i], "--watchdog") && i + 1 < argc) g_watchdog_s = strtoul(argv[++i], NULL, 0);
@@ -567,7 +792,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--native-trace")) native32_trace_native = 1;
         else if (!strcmp(argv[i], "--callbacks")) native32_trace_callbacks = 1;
         else {
-            printf("usage: ron [--run] [--headless] [--game INSTALL_DIR] [--gameargs \"...\"]\n"
+            printf("usage: ron [--run] [--headless] [--mute] [--game INSTALL_DIR] [--gameargs \"...\"]\n"
                    "          [--watchdog S] [--probe VA] [--native-trace] [--callbacks]\n");
             recomp_trace_help();
             return argv[i][1] == 'h' || argv[i][2] == 'h' ? 0 : 1;
@@ -627,12 +852,16 @@ int main(int argc, char** argv) {
         return 0;
     }
     /* The game reads its data relative to the working directory. */
+    if (mute) mute_audio();
+    if (g_headless) fake_active();
     claim_guest_path();
     hook_message_box();
     hook_change_display();
     hook_remote_session();
     hook_shader_compiler();
     if (!SetCurrentDirectoryA(game_full)) { fprintf(stderr, "cannot enter %s\n", game_full); return 1; }
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_main_thread, 0, FALSE,
+                    DUPLICATE_SAME_ACCESS);
     if (g_watchdog_s) CloseHandle(CreateThread(NULL, 0, watchdog, NULL, 0, NULL));
     printf("  entering 0x%08X\n\n", ron_entry_va);
     fflush(stdout);
