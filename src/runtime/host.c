@@ -740,7 +740,33 @@ static void snap_frame(IDXGISwapChain* sc) {
     }
     ID3D11DeviceContext_Release(cx); ID3D11Device_Release(dev); ID3D11Texture2D_Release(bb);
 }
+static long (WINAPI* real_SetFullscreenState)(IDXGISwapChain*, BOOL, IDXGIOutput*);
+static long WINAPI log_SetFullscreenState(IDXGISwapChain* sc, BOOL on, IDXGIOutput* o) {
+    long hr = real_SetFullscreenState(sc, on, o);
+    fprintf(stderr, "[dxgi] SetFullscreenState(%d) -> %08lX\n", on, hr); fflush(stderr);
+    return hr;
+}
+static int g_show_at_present;
+static HWND (WINAPI* real_CreateWindowExW)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
+static HWND WINAPI log_CreateWindowExW(DWORD ex, LPCWSTR c, LPCWSTR n, DWORD st, int x, int y, int cx, int cy, HWND p, HMENU m, HINSTANCE i, LPVOID l) {
+    /* The game's window is born a visible screen-sized popup, black until the
+     * game resizes it to its real mode: on screen, the whole display blanks.
+     * It is made hidden instead, and shown at the first Present. */
+    if ((ex & WS_EX_APPWINDOW) && (st & WS_POPUP) && (st & WS_VISIBLE)) { st &= ~WS_VISIBLE; g_show_at_present = 1; }
+    HWND w = real_CreateWindowExW(ex, c, n, st, x, y, cx, cy, p, m, i, l);
+    if (getenv("RON_LOG_WIN")) fprintf(stderr, "[win] CreateWindowExW %p ex=%lX style=%08lX %d,%d %dx%d t=%lu\n", (void*)w, ex, st, x, y, cx, cy, GetTickCount()); fflush(stderr);
+    return w;
+}
 static long WINAPI log_Present(IDXGISwapChain* sc, UINT sync, UINT fl) {
+    static IDXGISwapChain* seen;
+    if (sc != seen) {
+        DXGI_SWAP_CHAIN_DESC d; seen = sc;
+        if (SUCCEEDED(IDXGISwapChain_GetDesc(sc, &d)) && g_show_at_present && !IsWindowVisible(d.OutputWindow))
+            ShowWindow(d.OutputWindow, SW_SHOW);
+        if (SUCCEEDED(IDXGISwapChain_GetDesc(sc, &d)))
+            fprintf(stderr, "[dxgi] swap chain %ux%u windowed=%d effect=%d style=%08lX\n", d.BufferDesc.Width,
+                    d.BufferDesc.Height, d.Windowed, d.SwapEffect, GetWindowLongW(d.OutputWindow, GWL_STYLE));
+    }
     if (g_snapped < g_nsnap && GetTickCount() >= g_snap_at[g_snapped]) { snap_frame(sc); g_snapped++; }
     return real_Present(sc, sync, fl);
 }
@@ -749,7 +775,6 @@ static void hook_present(void) {
     DWORD t0 = GetTickCount();
     for (; p && *p && g_nsnap < 160; p += strspn(p, ", "))
         g_snap_at[g_nsnap++] = t0 + (DWORD)(1000 * strtod(p, (char**)&p));
-    if (!g_nsnap) return;
     HWND w = CreateWindowExA(0, "STATIC", "", WS_POPUP, 0, 0, 64, 64, NULL, NULL, NULL, NULL);
     DXGI_SWAP_CHAIN_DESC sd = { { 64, 64, { 60, 1 }, DXGI_FORMAT_R8G8B8A8_UNORM }, { 1, 0 },
                                 DXGI_USAGE_RENDER_TARGET_OUTPUT, 2, w, TRUE, DXGI_SWAP_EFFECT_FLIP_DISCARD };
@@ -757,6 +782,8 @@ static void hook_present(void) {
     if (FAILED(D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION,
                                              &sd, &sc, &dev, NULL, &cx))) { fprintf(stderr, "[snap] no swap chain\n"); return; }
     *(void**)&real_Present = hook_code((uint8_t*)sc->lpVtbl->Present, "Present", log_Present);
+    *(void**)&real_SetFullscreenState = hook_code((uint8_t*)sc->lpVtbl->SetFullscreenState, "SetFullscreenState",
+                                                  log_SetFullscreenState);
     IDXGISwapChain_Release(sc); ID3D11DeviceContext_Release(cx); ID3D11Device_Release(dev); DestroyWindow(w);
 }
 
@@ -853,10 +880,11 @@ int main(int argc, char** argv) {
     }
     /* The game reads its data relative to the working directory. */
     if (mute) mute_audio();
-    if (g_headless) fake_active();
+    if (g_headless) fake_active(); else hook_present();
     claim_guest_path();
     hook_message_box();
     hook_change_display();
+    *(void**)&real_CreateWindowExW = hook_export("user32.dll", "CreateWindowExW", log_CreateWindowExW);
     hook_remote_session();
     hook_shader_compiler();
     if (!SetCurrentDirectoryA(game_full)) { fprintf(stderr, "cannot enter %s\n", game_full); return 1; }
