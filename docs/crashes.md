@@ -33,7 +33,7 @@ Linux only, for completeness: WineHQ [31132](https://bugs.winehq.org/show_bug.cg
 Some sources could not be read (the fandom Game versions page, Reddit, one
 Workshop guide): rows 12 and 13 rest on search snippets. Alt-tab, high-DPI and
 non-native-resolution crashes were not found in what was read; QA covers
-them on testbox.
+them on the test VM.
 
 ## What the owner hits
 

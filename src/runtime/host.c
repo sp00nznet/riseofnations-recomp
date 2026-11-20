@@ -740,11 +740,33 @@ static void snap_frame(IDXGISwapChain* sc) {
     }
     ID3D11DeviceContext_Release(cx); ID3D11Device_Release(dev); ID3D11Texture2D_Release(bb);
 }
+/* Swap chain methods whose code can't be hooked (a push imm32 prologue) are
+ * swapped in the method table, which dxgi shares between its swap chains. */
+static void* patch_slot(void** vt, int i, void* to) {
+    DWORD was; void* old = vt[i];
+    if (old == to || !VirtualProtect(&vt[i], sizeof *vt, PAGE_READWRITE, &was)) return old;
+    vt[i] = to; VirtualProtect(&vt[i], sizeof *vt, was, &was);
+    return old;
+}
 static long (WINAPI* real_SetFullscreenState)(IDXGISwapChain*, BOOL, IDXGIOutput*);
 static long WINAPI log_SetFullscreenState(IDXGISwapChain* sc, BOOL on, IDXGIOutput* o) {
     long hr = real_SetFullscreenState(sc, on, o);
     fprintf(stderr, "[dxgi] SetFullscreenState(%d) -> %08lX\n", on, hr); fflush(stderr);
     return hr;
+}
+static long (WINAPI* real_ResizeTarget)(IDXGISwapChain*, const DXGI_MODE_DESC*);
+static long WINAPI log_ResizeTarget(IDXGISwapChain* sc, const DXGI_MODE_DESC* m) {
+    fprintf(stderr, "[dxgi] ResizeTarget %ux%u\n", m ? m->Width : 0, m ? m->Height : 0); fflush(stderr);
+    return real_ResizeTarget(sc, m);
+}
+static void** g_sc_vt;
+static void patch_swap_chain(IDXGISwapChain* sc) {
+    void** vt = *(void***)sc;
+    if (vt == g_sc_vt) return;
+    fprintf(stderr, "[dxgi] patching swap chain table %p (was %p)\n", (void*)vt, (void*)g_sc_vt);
+    g_sc_vt = vt;
+    *(void**)&real_SetFullscreenState = patch_slot(vt, 10, log_SetFullscreenState);
+    *(void**)&real_ResizeTarget = patch_slot(vt, 14, log_ResizeTarget);
 }
 static int g_show_at_present;
 static HWND (WINAPI* real_CreateWindowExW)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
@@ -761,6 +783,7 @@ static long WINAPI log_Present(IDXGISwapChain* sc, UINT sync, UINT fl) {
     static IDXGISwapChain* seen;
     if (sc != seen) {
         DXGI_SWAP_CHAIN_DESC d; seen = sc;
+        patch_swap_chain(sc);
         if (SUCCEEDED(IDXGISwapChain_GetDesc(sc, &d)) && g_show_at_present && !IsWindowVisible(d.OutputWindow))
             ShowWindow(d.OutputWindow, SW_SHOW);
         if (SUCCEEDED(IDXGISwapChain_GetDesc(sc, &d)))
@@ -782,8 +805,7 @@ static void hook_present(void) {
     if (FAILED(D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION,
                                              &sd, &sc, &dev, NULL, &cx))) { fprintf(stderr, "[snap] no swap chain\n"); return; }
     *(void**)&real_Present = hook_code((uint8_t*)sc->lpVtbl->Present, "Present", log_Present);
-    *(void**)&real_SetFullscreenState = hook_code((uint8_t*)sc->lpVtbl->SetFullscreenState, "SetFullscreenState",
-                                                  log_SetFullscreenState);
+    patch_swap_chain(sc);
     IDXGISwapChain_Release(sc); ID3D11DeviceContext_Release(cx); ID3D11Device_Release(dev); DestroyWindow(w);
 }
 

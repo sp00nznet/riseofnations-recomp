@@ -17,7 +17,7 @@ present"). The guest's 0x00400000..0x00FB4000 stays free either way.
 ## 1. A static initializer the catalog missed (run 1, 2026-11-08)
 
 ```
-ron.exe --run --headless --watchdog 60 --game "E:\SteamLibrary\steamapps\common\Rise of Nations"
+ron.exe --run --headless --watchdog 60 --game "<install>"
 [bind] 0x00400000: 461 native, 0 guest, 10 shimmed, 0 unresolved
   lifted functions in dispatch: 73895
   mapped riseofnations.exe: 0x00400000-0x00FB4000
@@ -36,14 +36,10 @@ lifted. Fix: `RUN_SEEDS` in run_lift.py; the lift is now 73,896 functions.
 
 Exit 3 = the host's fault report.
 
-### Where testbox was
+### Where it ran
 
-This run was meant for testbox, and ended up on the workstation (it's our own
-code, headless, with a 60 s watchdog). `netlab run ron --on testbox` started,
-then testbox (VM 103 on dpiprox2) stopped answering on 10.77.0.2: the VM
-runs and its desktop draws (another job's Strike Force window up front, from
-`qm monitor screendump`), but ping and ssh from the NAT bridge time out.
-Ops needs to look at it; the next run goes back to testbox.
+This run was meant for the test VM and ran on the workstation instead (our own
+code, headless, with a 60 s watchdog), as the VM was unreachable.
 
 ## 2. Next wall: a null read in sub_00A2B530 (run 2, 2026-11-08)
 
@@ -51,7 +47,7 @@ With the seed in (73,896 lifted, farm build copied off builder-clangcl-140),
 `_initterm` finishes and the game gets further into startup:
 
 ```
-ron.exe --run --headless --watchdog 60 --game "E:\SteamLibrary\steamapps\common\Rise of Nations"
+ron.exe --run --headless --watchdog 60 --game "<install>"
   lifted functions in dispatch: 73896
   entering 0x0055D699
 === fault 0xC0000005 at 0x321A81AC, thread 13300 ===
@@ -66,7 +62,7 @@ addresses on the guest stack point at its callers in `0x00B193D4` and
 The indirect-call ring is empty, so no import was involved. Not looked
 into yet: the next run should use `--calltrace` and `--watch 0x00A2B530`
 to find which pointer is null (most likely a global a missed initializer
-or an import shim should have filled), and run on testbox again once it's
+or an import shim should have filled), and run on the test VM again once it's
 reachable. No window yet, so no screenshot.
 
 ## 3. To the main menu and a battle (runs 3 to 79, 2026-11-11 to 11-18)

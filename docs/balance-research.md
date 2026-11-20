@@ -1,6 +1,6 @@
 # Rise of Nations: Extended Edition: balance complaints mapped to data
 
-Research date: 2026-11-18. Install read (read-only): `E:/SteamLibrary/steamapps/common/Rise of Nations/Data`.
+Research date: 2026-11-18. Install read (read-only): the Steam install's `Data` folder.
 Nothing in the install was modified. The house rules below are proposals for an opt-in override layer. None are implemented.
 
 ## Caveats
