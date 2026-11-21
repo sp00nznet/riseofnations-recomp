@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.1.0] - 2026-11-20
+
 - Playable: boots, menus, quick and custom battles render and play
   ([bringup.md](docs/bringup.md) section 3). The black 3D world was the CRT's
   SSE2 libm calls through the bridge, now shimmed.
